@@ -1,16 +1,21 @@
 import os
 import threading
+import traceback
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Self, cast
 from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.pq import TransactionStatus
 
 from aurora_mirrorcheck.heartbeat import (
+    DEFAULT_LOCK_TIMEOUT,
     DEFAULT_STATEMENT_TIMEOUT,
     HEARTBEAT_RETENTION,
     BeatFailure,
@@ -23,6 +28,38 @@ from aurora_mirrorcheck.heartbeat import (
 
 WRITTEN_AT = datetime(2026, 1, 1, tzinfo=UTC)
 SCHEMA_SQL = Path(__file__).parents[1] / "sql" / "heartbeat.sql"
+DSN_VARIABLE = "AURORA_MIRRORCHECK_TEST_DSN"
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Each of these can send libpq somewhere other than the `host` in the DSN.
+HOST_OVERRIDES = frozenset({"hostaddr", "service"})
+HOST_OVERRIDE_VARIABLES = ("PGHOSTADDR", "PGSERVICE")
+
+
+def require_local_dsn(dsn: str) -> str:
+    """Return `dsn` only if it can reach nothing but this machine.
+
+    The `database` tests drop the `aurora_mirrorcheck` schema, so anything else
+    raises. Messages never quote the DSN, because it holds a password.
+    """
+    try:
+        params = conninfo_to_dict(dsn)
+    except psycopg.Error:
+        raise ValueError(f"{DSN_VARIABLE} refused: it could not be parsed") from None
+
+    if params.get("host") not in LOCAL_HOSTS:
+        raise ValueError(f"{DSN_VARIABLE} refused: its host is not one of {sorted(LOCAL_HOSTS)}")
+    if HOST_OVERRIDES & params.keys():
+        raise ValueError(
+            f"{DSN_VARIABLE} refused: it sets {sorted(HOST_OVERRIDES & params.keys())}"
+        )
+    overrides = [name for name in HOST_OVERRIDE_VARIABLES if name in os.environ]
+    if overrides:
+        raise ValueError(f"{DSN_VARIABLE} refused: the environment sets {overrides}")
+    return dsn
+
+
+def admin_dsn() -> str:
+    return require_local_dsn(os.environ[DSN_VARIABLE])
 
 
 class FakeCursor:
@@ -47,7 +84,10 @@ class FakeTransaction:
 
 
 class FakeConnection:
-    """Records statements in order, and fails any statement containing `fail_on`."""
+    """Records statements in order, and fails any statement containing `fail_on`.
+
+    `status` is what the connection reports on arrival.
+    """
 
     def __init__(
         self,
@@ -55,7 +95,9 @@ class FakeConnection:
         error: Exception | None = None,
         insert_row: tuple[Any, ...] | None = (WRITTEN_AT,),
         purged: int = 0,
+        status: TransactionStatus = TransactionStatus.IDLE,
     ) -> None:
+        self.info = SimpleNamespace(transaction_status=status)
         self.log: list[str] = []
         self.params: list[tuple[Any, ...]] = []
         self.closed = False
@@ -135,27 +177,63 @@ def test_purge_binds_the_seven_day_retention() -> None:
     assert conn.params[3] == (HEARTBEAT_RETENTION,)
 
 
-@pytest.mark.parametrize(
-    ("timeout", "expected"),
-    [(DEFAULT_STATEMENT_TIMEOUT, "1800000"), (timedelta(seconds=5), "5000")],
-)
-def test_statement_timeout_applies_to_every_transaction(timeout: timedelta, expected: str) -> None:
+def test_heartbeat_timeouts_default_to_10_and_5_seconds() -> None:
     conn = FakeConnection()
 
-    beat(connector(conn), statement_timeout=timeout)
+    beat(connector(conn))
 
-    assert conn.params[0] == (expected,)
-    assert conn.params[2] == (expected,)
+    assert DEFAULT_STATEMENT_TIMEOUT == timedelta(seconds=10)
+    assert DEFAULT_LOCK_TIMEOUT == timedelta(seconds=5)
+    assert conn.params[0] == ("10000", "5000")
 
 
+def test_both_timeouts_apply_to_every_transaction() -> None:
+    conn = FakeConnection()
+
+    beat(
+        connector(conn),
+        statement_timeout=timedelta(seconds=7),
+        lock_timeout=timedelta(seconds=3),
+    )
+
+    assert "'statement_timeout'" in conn.log[1]
+    assert "'lock_timeout'" in conn.log[1]
+    assert conn.log[5] == conn.log[1]
+    assert conn.params[0] == ("7000", "3000")
+    assert conn.params[2] == ("7000", "3000")
+
+
+@pytest.mark.parametrize("name", ["statement_timeout", "lock_timeout"])
 @pytest.mark.parametrize("timeout", [timedelta(0), timedelta(microseconds=1), timedelta(-1)])
-def test_a_timeout_that_would_disable_the_limit_is_rejected(timeout: timedelta) -> None:
+def test_a_timeout_that_would_disable_the_limit_is_rejected(name: str, timeout: timedelta) -> None:
     conn = FakeConnection()
 
-    with pytest.raises(ValueError, match="statement_timeout"):
-        beat(connector(conn), statement_timeout=timeout)
+    with pytest.raises(ValueError, match=name):
+        beat(connector(conn), **{name: timeout})
 
     assert conn.log == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        TransactionStatus.INTRANS,
+        TransactionStatus.INERROR,
+        TransactionStatus.ACTIVE,
+        TransactionStatus.UNKNOWN,
+    ],
+)
+def test_a_connection_that_is_not_idle_is_a_write_failure(status: TransactionStatus) -> None:
+    conn = FakeConnection(status=status)
+
+    result = beat(connector(conn))
+
+    assert not result.ok
+    assert result.failure is BeatFailure.WRITE
+    assert result.heartbeat is None
+    assert result.detail == f"connection not idle ({status.name})"
+    assert conn.log == []
+    assert conn.closed
 
 
 def test_failed_connection_is_a_write_failure_and_not_ok() -> None:
@@ -285,6 +363,21 @@ def test_loop_continues_after_a_failed_beat() -> None:
     assert [r.failure for r in results] == [BeatFailure.WRITE, None]
 
 
+def test_loop_passes_both_timeouts_to_each_beat() -> None:
+    conn = FakeConnection()
+
+    run_heartbeat_loop(
+        connector(conn),
+        lambda _: None,
+        CountdownStop(ticks=1),
+        statement_timeout=timedelta(seconds=7),
+        lock_timeout=timedelta(seconds=3),
+        clock=lambda: 0.0,
+    )
+
+    assert conn.params[0] == ("7000", "3000")
+
+
 def test_loop_does_not_beat_once_stopped() -> None:
     conn = FakeConnection()
     stop = threading.Event()
@@ -296,11 +389,121 @@ def test_loop_does_not_beat_once_stopped() -> None:
 
 
 @pytest.fixture
+def no_host_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in HOST_OVERRIDE_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def no_connections(monkeypatch: pytest.MonkeyPatch) -> None:
+    def connect(*args: Any, **kwargs: Any) -> Connection:
+        pytest.fail("a refused DSN reached psycopg.connect")
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+
+@pytest.mark.usefixtures("no_host_overrides")
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://postgres:secret@127.0.0.1:55433/mirrorcheck_test",
+        "postgresql://postgres:secret@localhost/mirrorcheck_test",
+        "postgresql://postgres:secret@[::1]:55433/mirrorcheck_test",
+        "host=127.0.0.1 port=55433 dbname=mirrorcheck_test",
+        "host=::1 dbname=mirrorcheck_test",
+    ],
+)
+def test_guard_accepts_a_loopback_dsn(dsn: str) -> None:
+    assert require_local_dsn(dsn) == dsn
+
+
+@pytest.mark.usefixtures("no_host_overrides")
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://postgres:secret@db.example.com/prod",
+        "postgresql://postgres:secret@writer.cluster-x.us-east-1.rds.amazonaws.com/prod",
+        "host=10.0.0.1 dbname=prod",
+        "host=127.0.0.2 dbname=prod",
+        "host=LOCALHOST dbname=prod",
+        "host=localhost.example.com dbname=prod",
+        "postgresql://postgres:secret@127.0.0.1.example.com/prod",
+        # Several hosts: libpq would fall through to the remote one.
+        "host=localhost,db.example.com dbname=prod",
+        "postgresql://postgres:secret@localhost,db.example.com/prod",
+        # The query string overrides the authority.
+        "postgresql://postgres:secret@localhost/prod?host=db.example.com",
+        # No host: libpq falls back to PGHOST or a socket, whatever those are today.
+        "",
+        "dbname=prod",
+        "postgresql:///prod",
+        "host=/var/run/postgresql dbname=prod",
+    ],
+)
+def test_guard_refuses_any_other_host(dsn: str) -> None:
+    with pytest.raises(ValueError, match="refused: its host"):
+        require_local_dsn(dsn)
+
+
+@pytest.mark.usefixtures("no_host_overrides")
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "host=localhost hostaddr=10.0.0.1 dbname=prod",
+        "postgresql://postgres:secret@localhost/prod?hostaddr=10.0.0.1",
+        "host=localhost service=prod",
+    ],
+)
+def test_guard_refuses_a_local_host_that_another_setting_overrides(dsn: str) -> None:
+    with pytest.raises(ValueError, match="refused: it sets"):
+        require_local_dsn(dsn)
+
+
+@pytest.mark.parametrize("name", HOST_OVERRIDE_VARIABLES)
+def test_guard_refuses_a_host_override_in_the_environment(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(name, "10.0.0.1")
+
+    with pytest.raises(ValueError, match=name):
+        require_local_dsn("host=127.0.0.1 dbname=mirrorcheck_test")
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    ["postgresql://postgres:hunter2@db.example.com/prod", "hunter2"],
+)
+def test_a_refusal_never_quotes_the_password(dsn: str) -> None:
+    with pytest.raises(ValueError, match="refused") as refused:
+        require_local_dsn(dsn)
+
+    assert "hunter2" not in "".join(traceback.format_exception(refused.value))
+
+
+@pytest.mark.usefixtures("no_connections")
+def test_the_database_fixture_fails_on_a_refused_dsn_instead_of_skipping(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, "postgresql://postgres:secret@db.example.com/prod")
+
+    with pytest.raises(ValueError, match="refused"):
+        request.getfixturevalue("database")
+
+
+@pytest.mark.usefixtures("no_connections")
+def test_direct_admin_queries_refuse_a_remote_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, "postgresql://postgres:secret@db.example.com/prod")
+
+    with pytest.raises(ValueError, match="refused"):
+        admin_rows("SELECT 1")
+
+
+@pytest.fixture
 def database() -> Iterator[Callable[..., Connection]]:
     """Connect as a role with only the grants FR-01 needs, on a disposable local server."""
-    dsn = os.environ.get("AURORA_MIRRORCHECK_TEST_DSN")
-    if dsn is None:
-        pytest.skip("AURORA_MIRRORCHECK_TEST_DSN is not set")
+    if DSN_VARIABLE not in os.environ:
+        pytest.skip(f"{DSN_VARIABLE} is not set")
+    dsn = admin_dsn()
 
     role = "mirrorcheck_test"
     with psycopg.connect(dsn, autocommit=True) as admin:
@@ -325,8 +528,7 @@ def database() -> Iterator[Callable[..., Connection]]:
 
 
 def admin_rows(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-    dsn = os.environ["AURORA_MIRRORCHECK_TEST_DSN"]
-    with psycopg.connect(dsn, autocommit=True) as admin:
+    with psycopg.connect(admin_dsn(), autocommit=True) as admin:
         return admin.execute(sql.encode(), params).fetchall()
 
 
@@ -390,17 +592,51 @@ def test_real_read_only_session_is_a_write_failure(database: Callable[..., Conne
 
 
 @pytest.mark.database
+def test_real_open_transaction_is_a_write_failure_and_adds_no_row(
+    database: Callable[..., Connection],
+) -> None:
+    def connect() -> Connection:
+        conn = database()
+        conn.execute("SELECT 1")
+        return conn
+
+    result = beat(connect)
+
+    assert not result.ok
+    assert result.failure is BeatFailure.WRITE
+    assert result.heartbeat is None
+    assert result.detail == "connection not idle (INTRANS)"
+    assert admin_rows("SELECT 1 FROM aurora_mirrorcheck.heartbeat") == []
+
+
+@pytest.mark.database
 def test_real_statement_timeout_cancels_a_blocked_write(
     database: Callable[..., Connection],
 ) -> None:
-    dsn = os.environ["AURORA_MIRRORCHECK_TEST_DSN"]
-    with psycopg.connect(dsn) as locker:
+    with psycopg.connect(admin_dsn()) as locker:
         locker.execute("LOCK TABLE aurora_mirrorcheck.heartbeat")
 
         result = beat(database, statement_timeout=timedelta(milliseconds=200))
 
     assert result.failure is BeatFailure.WRITE
     assert result.detail == "QueryCanceled (57014)"
+
+
+@pytest.mark.database
+def test_real_lock_timeout_fails_a_queued_lock_before_the_statement_timeout(
+    database: Callable[..., Connection],
+) -> None:
+    with psycopg.connect(admin_dsn()) as locker:
+        locker.execute("LOCK TABLE aurora_mirrorcheck.heartbeat")
+
+        result = beat(
+            database,
+            statement_timeout=timedelta(seconds=30),
+            lock_timeout=timedelta(milliseconds=200),
+        )
+
+    assert result.failure is BeatFailure.WRITE
+    assert result.detail == "LockNotAvailable (55P03)"
 
 
 @pytest.mark.database
