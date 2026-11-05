@@ -4,9 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This is a Python project, but it has no code yet, so there are no build, lint or test commands. The only source of truth is `PRD/aurora-mirrorcheck-prd.md`. Add commands here once tooling exists.
+This is a Python project managed with uv. Only the package skeleton exists so far: `gate` and `attest` are stubs that exit 2 (ERROR). The source of truth is `PRD/aurora-mirrorcheck-prd.md`.
 
 Requirement IDs (`FR-xx`, `NFR-xx`) come from the PRD; cite them when implementing. Check the PRD's open questions before hardcoding a value: the RPO budget, `rds.global_db_rpo` setting, approver roles, retention period, L4 table list and off-peak window are all undecided. Whether L3 is built in-house or uses pgCompare is also open, pending a one-week spike.
+
+## Commands
+
+```bash
+uv sync                                                # Install dependencies
+uv run ruff check .                                    # Lint
+uv run ruff format --check .                           # Check formatting
+uv run mypy src                                        # Type check
+uv run pytest                                          # Run tests
+uv run pytest tests/test_cli.py::test_help_exits_zero  # Run a single test
+uv run aurora-mirrorcheck --help                       # Run the CLI
+```
+
+Tests marked `database` are excluded from the default run.
+
+If the repo is in an iCloud-synced folder such as `~/Documents`, iCloud can hide files in `.venv`. Python then skips the hidden editable-install `.pth` file and fails with `ModuleNotFoundError: No module named 'aurora_mirrorcheck'`. Set `UV_PROJECT_ENVIRONMENT` to a path outside iCloud to avoid this.
 
 ## What the tool is
 

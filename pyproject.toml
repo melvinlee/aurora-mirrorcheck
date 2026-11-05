@@ -1,0 +1,39 @@
+[project]
+name = "aurora-mirrorcheck"
+version = "0.1.0"
+description = "Validates that the secondary-region Aurora PostgreSQL cluster matches the primary within the RPO and produces DR test sign-off evidence."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+aurora-mirrorcheck = "aurora_mirrorcheck.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers -m 'not database'"
+markers = ["database: needs a real database; excluded from the default run"]
