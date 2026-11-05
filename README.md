@@ -30,7 +30,13 @@ uv run mypy src               # Type check
 uv run pytest                 # Run tests
 ```
 
-Tests marked `database` are excluded from the default run.
+Tests marked `database` are excluded from the default run. They need a disposable PostgreSQL server, which the `pg-podman` agent can start. Point `AURORA_MIRRORCHECK_TEST_DSN` at it and select them with `-m database`:
+
+```bash
+AURORA_MIRRORCHECK_TEST_DSN='postgresql://postgres:mirrorcheck_test@127.0.0.1:55433/mirrorcheck_test' uv run pytest -m database
+```
+
+These tests drop the `aurora_mirrorcheck` schema, so never point them at a server you care about. The test run fails unless the DSN's host is exactly `localhost`, `127.0.0.1` or `::1`, and it also refuses `hostaddr`, `service`, `PGHOSTADDR` and `PGSERVICE`. If `AURORA_MIRRORCHECK_TEST_DSN` isn't set, the `database` tests skip. The check can't tell what is listening on the port, so don't use it with a tunnel or port-forward to a real database.
 
 To add a dependency, use `uv add <package>`, or `uv add --dev <package>` for a dev tool. Commit the changes to both `pyproject.toml` and `uv.lock`.
 
