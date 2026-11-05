@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This is a Python project managed with uv. Only the package skeleton exists so far: `gate` and `attest` are stubs that exit 2 (ERROR). The source of truth is `PRD/aurora-mirrorcheck-prd.md`.
+This is a Python project managed with uv. The heartbeat writer (FR-01) exists as library code, but no runner calls it yet, and `gate` and `attest` are stubs that exit 2 (ERROR). The source of truth is `PRD/aurora-mirrorcheck-prd.md`.
 
 Requirement IDs (`FR-xx`, `NFR-xx`) come from the PRD; cite them when implementing. Check the PRD's open questions before hardcoding a value: the RPO budget, `rds.global_db_rpo` setting, approver roles, retention period, L4 table list and off-peak window are all undecided. Whether L3 is built in-house or uses pgCompare is also open, pending a one-week spike.
 
@@ -20,7 +20,7 @@ uv run pytest tests/test_cli.py::test_help_exits_zero  # Run a single test
 uv run aurora-mirrorcheck --help                       # Run the CLI
 ```
 
-Tests marked `database` are excluded from the default run. They need `AURORA_MIRRORCHECK_TEST_DSN` set to a disposable server, which the `pg-podman` agent can start. They drop the `aurora_mirrorcheck` schema and the `mirrorcheck_test` role, so the run fails unless the host in the DSN is exactly `localhost`, `127.0.0.1` or `::1`.
+Tests marked `database` are excluded from the default run. They need `AURORA_MIRRORCHECK_TEST_DSN` set to a disposable server, which the `pg-podman` agent can start. They drop the `aurora_mirrorcheck` schema and the `mirrorcheck_test` role, so the run fails unless the host in the DSN is exactly `localhost`, `127.0.0.1` or `::1`. The DSN must not set `hostaddr` or `service`, and `PGHOSTADDR` and `PGSERVICE` must be unset. Tests that use `ALTER SYSTEM` also need the database to be named `mirrorcheck_test`.
 
 If the repo is in an iCloud-synced folder such as `~/Documents`, iCloud can hide files in `.venv`. Python then skips the hidden editable-install `.pth` file and fails with `ModuleNotFoundError: No module named 'aurora_mirrorcheck'`. Set `UV_PROJECT_ENVIRONMENT` to a path outside iCloud to avoid this.
 

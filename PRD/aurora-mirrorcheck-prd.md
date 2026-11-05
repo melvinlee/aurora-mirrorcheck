@@ -83,7 +83,7 @@ Six layers, from cheap and continuous to heavy and on demand. A gate run execute
 | --- | --- | --- |
 | FR-01 | Write a heartbeat row (nonce, written\_at) to `aurora_mirrorcheck.heartbeat` on the primary writer every 30 s; purge rows older than 7 days | Must |
 | FR-02 | Poll the secondary reader until the row is visible and record visible lag; a timeout at the RPO budget is a FAIL | Must |
-| FR-03 | Report a heartbeat that could not be written separately from a lag breach | Must |
+| FR-03 | Report a heartbeat that could not be written separately from a lag breach, and report a heartbeat whose outcome is unknown, such as a commit that passed the client deadline, as its own result, never as a success or a lag breach | Must |
 
 ### L1 Replication health (every 1 min)
 
@@ -138,7 +138,7 @@ Six layers, from cheap and continuous to heavy and on demand. A gate run execute
 | NFR-02 | Security | Credentials from Secrets Manager or IAM DB auth via IRSA; no secrets in config, images or logs |
 | NFR-03 | Security | TLS (`sslmode=verify-full`) to both regions |
 | NFR-04 | Data handling | Evidence holds counts, hashes and primary keys only, never row contents |
-| NFR-05 | Load | No query on the primary writer except the heartbeat; statement timeout on every query (default 30 min). The heartbeat is the exception: 10 s statement timeout per statement and 5 s lock timeout, both configurable |
+| NFR-05 | Load | No query on the primary writer except the heartbeat; statement timeout on every query (default 30 min). The heartbeat is the exception: 10 s statement timeout per statement, 5 s lock timeout and a 25 s client-side deadline per beat, all configurable. The deadline is there because the server timeouts do not cover COMMIT |
 | NFR-06 | Load | Full checksum runs off-peak; concurrency configurable, default 2 tables at a time |
 | NFR-07 | Performance | A full gate run on 20 GB finishes within 30 min |
 | NFR-08 | Correctness | Zero false FAILs caused by replication lag; every FAIL is reproducible from the evidence |
