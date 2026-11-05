@@ -970,7 +970,10 @@ def standby_setting_in_force(value: str) -> Iterator[None]:
 
     If the block hangs in a commit that waits for the standby, a watchdog resets the
     setting after `BLOCK_LIMIT_SECONDS`, and that fails the test instead of hanging it.
+
+    The check comes before the `try`, because the reset would erase a value we didn't set.
     """
+    clear_standby_setting_left_by_a_killed_run()
     released_a_hang = threading.Event()
 
     def release() -> None:
@@ -1049,6 +1052,21 @@ def test_real_database_fixture_leaves_any_other_standby_setting_alone(
     with standby_setting_in_force(other):
         with pytest.raises(pytest.fail.Exception, match=f"{other}.*left unchanged"):
             request.getfixturevalue("database")
+
+        assert admin_rows(SHOW_STANDBY_NAMES) == [(other,)]
+
+
+@pytest.mark.database
+@pytest.mark.usefixtures("dsn_is_set")
+def test_real_tests_that_change_the_standby_setting_leave_any_other_value_alone() -> None:
+    other = "someone_elses_standby"
+
+    with standby_setting_in_force(other):
+        with (
+            pytest.raises(pytest.fail.Exception, match=f"{other}.*left unchanged"),
+            standby_setting_in_force(STANDBY_SENTINEL),
+        ):
+            pytest.fail("the block ran over a value these tests did not set")
 
         assert admin_rows(SHOW_STANDBY_NAMES) == [(other,)]
 
