@@ -1,5 +1,8 @@
 import os
+import subprocess
+import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import closing
@@ -15,6 +18,7 @@ from psycopg.conninfo import conninfo_to_dict
 from psycopg.pq import TransactionStatus
 
 from aurora_mirrorcheck.heartbeat import (
+    DEFAULT_DEADLINE,
     DEFAULT_LOCK_TIMEOUT,
     DEFAULT_STATEMENT_TIMEOUT,
     HEARTBEAT_RETENTION,
@@ -33,33 +37,55 @@ LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # Each of these can send libpq somewhere other than the `host` in the DSN.
 HOST_OVERRIDES = frozenset({"hostaddr", "service"})
 HOST_OVERRIDE_VARIABLES = ("PGHOSTADDR", "PGSERVICE")
+SHORT_DEADLINE = timedelta(milliseconds=50)
+# A test's blocked commit gives up after this long, so a bug fails it instead of hanging it.
+BLOCK_LIMIT_SECONDS = 10.0
 
 
-def require_local_dsn(dsn: str) -> str:
-    """Return `dsn` only if it can reach nothing but this machine.
+def _dsn_refusal() -> str | None:
+    """Say why the DSN is refused, or return `None` if it can reach only this machine.
 
-    The `database` tests drop the `aurora_mirrorcheck` schema, so anything else
-    raises. Messages never quote the DSN, because it holds a password.
+    This returns rather than raises so that no frame holding the DSN, or the
+    password parsed out of it, is on the traceback for pytest to render (NFR-02).
     """
     try:
-        params = conninfo_to_dict(dsn)
+        params = conninfo_to_dict(os.environ.get(DSN_VARIABLE, ""))
     except psycopg.Error:
-        raise ValueError(f"{DSN_VARIABLE} refused: it could not be parsed") from None
+        return "it could not be parsed"
 
     if params.get("host") not in LOCAL_HOSTS:
-        raise ValueError(f"{DSN_VARIABLE} refused: its host is not one of {sorted(LOCAL_HOSTS)}")
+        return f"its host is not one of {sorted(LOCAL_HOSTS)}"
     if HOST_OVERRIDES & params.keys():
-        raise ValueError(
-            f"{DSN_VARIABLE} refused: it sets {sorted(HOST_OVERRIDES & params.keys())}"
-        )
+        return f"it sets {sorted(HOST_OVERRIDES & params.keys())}"
     overrides = [name for name in HOST_OVERRIDE_VARIABLES if name in os.environ]
     if overrides:
-        raise ValueError(f"{DSN_VARIABLE} refused: the environment sets {overrides}")
-    return dsn
+        return f"the environment sets {overrides}"
+    return None
 
 
-def admin_dsn() -> str:
-    return require_local_dsn(os.environ[DSN_VARIABLE])
+def require_local_dsn() -> str:
+    """Return the test DSN only if it can reach nothing but this machine.
+
+    The `database` tests drop the `aurora_mirrorcheck` schema, so anything else
+    raises. It reads the variable itself so that the DSN is never an argument,
+    which pytest prints in a failure. Don't keep the result in a local either.
+    """
+    refusal = _dsn_refusal()
+    if refusal is not None:
+        raise ValueError(f"{DSN_VARIABLE} refused: {refusal}")
+    return os.environ[DSN_VARIABLE]
+
+
+def connect_to_test_server(**kwargs: Any) -> Connection:
+    """Connect without letting a failure render psycopg's frames, which hold the DSN (NFR-02)."""
+    try:
+        return psycopg.connect(require_local_dsn(), **kwargs)
+    except psycopg.Error as exc:
+        raise ConnectionError(f"could not connect to the test server: {_error_name(exc)}") from None
+
+
+def _error_name(exc: psycopg.Error) -> str:
+    return type(exc).__name__ if exc.sqlstate is None else f"{type(exc).__name__} ({exc.sqlstate})"
 
 
 class FakeCursor:
@@ -80,6 +106,8 @@ class FakeTransaction:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if not exc_type:
+            self._conn.before_commit()
         self._conn.log.append("ROLLBACK" if exc_type else "COMMIT")
 
 
@@ -106,6 +134,9 @@ class FakeConnection:
         self._insert_row = insert_row
         self._purged = purged
 
+    def before_commit(self) -> None:
+        """Runs where a real COMMIT would wait, outside any server timeout."""
+
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
 
@@ -120,8 +151,44 @@ class FakeConnection:
         self.closed = True
 
 
+class StuckCommitConnection(FakeConnection):
+    """Blocks in its first COMMIT until `release` is set, then raises `late_error` if given."""
+
+    def __init__(self, late_error: Exception | None = None) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.committing = threading.Event()
+        self.late_error = late_error
+
+    def before_commit(self) -> None:
+        self.committing.set()
+        if not self.release.wait(BLOCK_LIMIT_SECONDS):
+            raise AssertionError("nothing released the blocked commit")
+        if self.late_error is not None:
+            raise self.late_error
+
+
 def connector(conn: FakeConnection) -> Callable[[], Connection]:
     return lambda: cast(Connection, conn)
+
+
+def counting_connector(*conns: FakeConnection) -> tuple[Callable[[], Connection], list[None]]:
+    """Hand out `conns` in turn, and record one entry for each connection opened."""
+    remaining = iter(conns)
+    opened: list[None] = []
+
+    def connect() -> Connection:
+        opened.append(None)
+        return cast(Connection, next(remaining))
+
+    return connect, opened
+
+
+def wait_until(condition: Callable[[], bool]) -> None:
+    limit = time.monotonic() + BLOCK_LIMIT_SECONDS
+    while not condition():
+        assert time.monotonic() < limit, "condition not met in time"
+        time.sleep(0.01)
 
 
 def test_beat_writes_then_purges_in_separate_committed_transactions() -> None:
@@ -203,13 +270,37 @@ def test_both_timeouts_apply_to_every_transaction() -> None:
     assert conn.params[2] == ("7000", "3000")
 
 
-@pytest.mark.parametrize("name", ["statement_timeout", "lock_timeout"])
+@pytest.mark.parametrize("name", ["statement_timeout", "lock_timeout", "deadline"])
 @pytest.mark.parametrize("timeout", [timedelta(0), timedelta(microseconds=1), timedelta(-1)])
 def test_a_timeout_that_would_disable_the_limit_is_rejected(name: str, timeout: timedelta) -> None:
     conn = FakeConnection()
 
     with pytest.raises(ValueError, match=name):
         beat(connector(conn), **{name: timeout})
+
+    assert conn.log == []
+
+
+@pytest.mark.parametrize("name", ["statement_timeout", "lock_timeout", "deadline"])
+def test_the_loop_rejects_a_bad_timeout_before_starting_a_beat(name: str) -> None:
+    conn = FakeConnection()
+
+    with pytest.raises(ValueError, match=name):
+        run_heartbeat_loop(
+            connector(conn), lambda _: None, CountdownStop(ticks=1), **{name: timedelta(0)}
+        )
+
+    assert conn.log == []
+
+
+@pytest.mark.parametrize("deadline", [timedelta(seconds=30), timedelta(minutes=5)])
+def test_the_loop_rejects_a_deadline_that_could_swallow_a_slot(deadline: timedelta) -> None:
+    conn = FakeConnection()
+
+    with pytest.raises(ValueError, match="deadline must be under"):
+        run_heartbeat_loop(
+            connector(conn), lambda _: None, CountdownStop(ticks=1), deadline=deadline
+        )
 
     assert conn.log == []
 
@@ -388,6 +479,148 @@ def test_loop_does_not_beat_once_stopped() -> None:
     assert conn.log == []
 
 
+def test_deadline_defaults_to_inside_the_30_second_interval() -> None:
+    assert DEFAULT_DEADLINE == timedelta(seconds=25)
+
+
+def test_a_commit_stuck_past_the_deadline_is_unknown_and_never_ok() -> None:
+    conn = StuckCommitConnection()
+
+    result = beat(connector(conn), deadline=SHORT_DEADLINE)
+
+    assert conn.committing.is_set()
+    assert not conn.closed
+    assert not result.ok
+    assert result.failure is BeatFailure.UNKNOWN
+    assert result.heartbeat is None
+    assert result.purged is None
+    assert result.detail is not None
+    assert "unknown" in result.detail
+    assert "may still commit" in result.detail
+
+    conn.release.set()
+    wait_until(lambda: conn.closed)
+
+
+def test_a_beat_that_beats_the_deadline_still_reports_its_result() -> None:
+    conn = StuckCommitConnection()
+    conn.release.set()
+
+    assert beat(connector(conn), deadline=timedelta(seconds=5)).ok
+
+
+def test_loop_reports_each_slot_while_stuck_and_never_overlaps_a_beat() -> None:
+    stuck = StuckCommitConnection()
+    connect, opened = counting_connector(stuck, FakeConnection())
+    results: list[BeatResult] = []
+    stop = CountdownStop(ticks=4)
+
+    run_heartbeat_loop(connect, results.append, stop, deadline=SHORT_DEADLINE, clock=lambda: 0.0)
+    stuck.release.set()
+
+    assert len(opened) == 1
+    assert stop.waits == [30.0, 30.0, 30.0, 30.0]
+    assert [r.failure for r in results] == [BeatFailure.UNKNOWN] * 4
+    assert not any(r.ok for r in results)
+    assert all(r.detail is not None and "unknown" in r.detail for r in results)
+    assert results[0].detail != results[1].detail
+    wait_until(lambda: stuck.closed)
+
+
+def test_loop_honours_stop_during_a_stuck_commit_without_waiting_for_the_deadline() -> None:
+    stuck = StuckCommitConnection()
+    results: list[BeatResult] = []
+    stop = threading.Event()
+    loop = threading.Thread(
+        target=run_heartbeat_loop, args=(connector(stuck), results.append, stop), daemon=True
+    )
+
+    loop.start()
+    assert stuck.committing.wait(BLOCK_LIMIT_SECONDS)
+    stop.set()
+    loop.join(5)
+    stopped = not loop.is_alive()
+    stuck.release.set()
+
+    assert stopped
+    assert [r.failure for r in results] == [BeatFailure.UNKNOWN]
+    wait_until(lambda: stuck.closed)
+
+
+def test_a_late_result_is_dropped_and_never_stands_in_for_a_later_slot() -> None:
+    stuck = StuckCommitConnection()
+    fresh = FakeConnection()
+    connect, opened = counting_connector(stuck, fresh)
+    results: list[BeatResult] = []
+
+    class ReleaseAfterFirstSlot(CountdownStop):
+        def wait(self, timeout: float | None = None) -> bool:
+            if not self.waits:
+                stuck.release.set()
+                wait_until(lambda: stuck.closed)
+            return super().wait(timeout)
+
+    run_heartbeat_loop(
+        connect,
+        results.append,
+        ReleaseAfterFirstSlot(ticks=2),
+        deadline=SHORT_DEADLINE,
+        clock=lambda: 0.0,
+    )
+
+    assert len(opened) == 2
+    assert [r.failure for r in results] == [BeatFailure.UNKNOWN, None]
+    late_nonce = stuck.params[1][0]
+    assert results[1].heartbeat is not None
+    assert results[1].heartbeat.nonce == fresh.params[1][0]
+    assert results[1].heartbeat.nonce != late_nonce
+
+
+def test_a_late_unexpected_error_is_raised_at_the_next_slot() -> None:
+    stuck = StuckCommitConnection(late_error=KeyError("bug"))
+    connect, opened = counting_connector(stuck, FakeConnection())
+
+    class ReleaseAfterFirstSlot(CountdownStop):
+        def wait(self, timeout: float | None = None) -> bool:
+            stuck.release.set()
+            wait_until(lambda: stuck.closed)
+            return super().wait(timeout)
+
+    with pytest.raises(KeyError):
+        run_heartbeat_loop(
+            connect,
+            lambda _: None,
+            ReleaseAfterFirstSlot(ticks=2),
+            deadline=SHORT_DEADLINE,
+            clock=lambda: 0.0,
+        )
+
+    assert len(opened) == 1
+
+
+def test_a_stuck_worker_does_not_hold_up_process_exit() -> None:
+    script = """
+import threading
+from datetime import timedelta
+from aurora_mirrorcheck.heartbeat import run_heartbeat_loop
+
+class Stop(threading.Event):
+    def wait(self, timeout=None):
+        self.set()
+        return True
+
+def connect():
+    threading.Event().wait()
+
+run_heartbeat_loop(connect, print, Stop(), deadline=timedelta(milliseconds=50))
+"""
+    finished = subprocess.run(  # noqa: S603 - fixed script, run with this interpreter
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=20, check=True
+    )
+
+    assert "unknown" in finished.stdout
+
+
 @pytest.fixture
 def no_host_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in HOST_OVERRIDE_VARIABLES:
@@ -413,8 +646,10 @@ def no_connections(monkeypatch: pytest.MonkeyPatch) -> None:
         "host=::1 dbname=mirrorcheck_test",
     ],
 )
-def test_guard_accepts_a_loopback_dsn(dsn: str) -> None:
-    assert require_local_dsn(dsn) == dsn
+def test_guard_accepts_a_loopback_dsn(dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, dsn)
+
+    assert require_local_dsn() == dsn
 
 
 @pytest.mark.usefixtures("no_host_overrides")
@@ -440,9 +675,19 @@ def test_guard_accepts_a_loopback_dsn(dsn: str) -> None:
         "host=/var/run/postgresql dbname=prod",
     ],
 )
-def test_guard_refuses_any_other_host(dsn: str) -> None:
+def test_guard_refuses_any_other_host(dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, dsn)
+
     with pytest.raises(ValueError, match="refused: its host"):
-        require_local_dsn(dsn)
+        require_local_dsn()
+
+
+@pytest.mark.usefixtures("no_host_overrides")
+def test_guard_refuses_an_unset_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(DSN_VARIABLE, raising=False)
+
+    with pytest.raises(ValueError, match="refused: its host"):
+        require_local_dsn()
 
 
 @pytest.mark.usefixtures("no_host_overrides")
@@ -454,9 +699,13 @@ def test_guard_refuses_any_other_host(dsn: str) -> None:
         "host=localhost service=prod",
     ],
 )
-def test_guard_refuses_a_local_host_that_another_setting_overrides(dsn: str) -> None:
+def test_guard_refuses_a_local_host_that_another_setting_overrides(
+    dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, dsn)
+
     with pytest.raises(ValueError, match="refused: it sets"):
-        require_local_dsn(dsn)
+        require_local_dsn()
 
 
 @pytest.mark.parametrize("name", HOST_OVERRIDE_VARIABLES)
@@ -464,18 +713,21 @@ def test_guard_refuses_a_host_override_in_the_environment(
     name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(name, "10.0.0.1")
+    monkeypatch.setenv(DSN_VARIABLE, "host=127.0.0.1 dbname=mirrorcheck_test")
 
     with pytest.raises(ValueError, match=name):
-        require_local_dsn("host=127.0.0.1 dbname=mirrorcheck_test")
+        require_local_dsn()
 
 
 @pytest.mark.parametrize(
     "dsn",
     ["postgresql://postgres:hunter2@db.example.com/prod", "hunter2"],
 )
-def test_a_refusal_never_quotes_the_password(dsn: str) -> None:
+def test_a_refusal_never_quotes_the_password(dsn: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(DSN_VARIABLE, dsn)
+
     with pytest.raises(ValueError, match="refused") as refused:
-        require_local_dsn(dsn)
+        require_local_dsn()
 
     assert "hunter2" not in "".join(traceback.format_exception(refused.value))
 
@@ -486,8 +738,13 @@ def test_the_database_fixture_fails_on_a_refused_dsn_instead_of_skipping(
 ) -> None:
     monkeypatch.setenv(DSN_VARIABLE, "postgresql://postgres:secret@db.example.com/prod")
 
+    # `pytest.skip` raises a `BaseException`, which `pytest.raises` would let through
+    # as a skip, so this test would read as SKIPPED rather than fail.
     with pytest.raises(ValueError, match="refused"):
-        request.getfixturevalue("database")
+        try:
+            request.getfixturevalue("database")
+        except pytest.skip.Exception:
+            pytest.fail("a refused DSN skipped the database tests instead of failing them")
 
 
 @pytest.mark.usefixtures("no_connections")
@@ -503,10 +760,9 @@ def database() -> Iterator[Callable[..., Connection]]:
     """Connect as a role with only the grants FR-01 needs, on a disposable local server."""
     if DSN_VARIABLE not in os.environ:
         pytest.skip(f"{DSN_VARIABLE} is not set")
-    dsn = admin_dsn()
 
     role = "mirrorcheck_test"
-    with psycopg.connect(dsn, autocommit=True) as admin:
+    with connect_to_test_server(autocommit=True) as admin:
         admin.execute("DROP SCHEMA IF EXISTS aurora_mirrorcheck CASCADE")
         admin.execute(f"DROP ROLE IF EXISTS {role}")
         admin.execute(f"CREATE ROLE {role} LOGIN")
@@ -515,20 +771,20 @@ def database() -> Iterator[Callable[..., Connection]]:
         admin.execute(f"GRANT SELECT, INSERT, DELETE ON aurora_mirrorcheck.heartbeat TO {role}")
 
     def connect(**kwargs: Any) -> Connection:
-        conn = psycopg.connect(dsn, **kwargs)
+        conn = connect_to_test_server(**kwargs)
         conn.execute(f"SET SESSION AUTHORIZATION {role}")
         conn.commit()
         return conn
 
     yield connect
 
-    with psycopg.connect(dsn, autocommit=True) as admin:
+    with connect_to_test_server(autocommit=True) as admin:
         admin.execute("DROP SCHEMA aurora_mirrorcheck CASCADE")
         admin.execute(f"DROP ROLE {role}")
 
 
 def admin_rows(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-    with psycopg.connect(admin_dsn(), autocommit=True) as admin:
+    with connect_to_test_server(autocommit=True) as admin:
         return admin.execute(sql.encode(), params).fetchall()
 
 
@@ -613,7 +869,7 @@ def test_real_open_transaction_is_a_write_failure_and_adds_no_row(
 def test_real_statement_timeout_cancels_a_blocked_write(
     database: Callable[..., Connection],
 ) -> None:
-    with psycopg.connect(admin_dsn()) as locker:
+    with connect_to_test_server() as locker:
         locker.execute("LOCK TABLE aurora_mirrorcheck.heartbeat")
 
         result = beat(database, statement_timeout=timedelta(milliseconds=200))
@@ -626,7 +882,7 @@ def test_real_statement_timeout_cancels_a_blocked_write(
 def test_real_lock_timeout_fails_a_queued_lock_before_the_statement_timeout(
     database: Callable[..., Connection],
 ) -> None:
-    with psycopg.connect(admin_dsn()) as locker:
+    with connect_to_test_server() as locker:
         locker.execute("LOCK TABLE aurora_mirrorcheck.heartbeat")
 
         result = beat(
@@ -637,6 +893,56 @@ def test_real_lock_timeout_fails_a_queued_lock_before_the_statement_timeout(
 
     assert result.failure is BeatFailure.WRITE
     assert result.detail == "LockNotAvailable (55P03)"
+
+
+def set_synchronous_standby_names(value: str) -> None:
+    """Change the server-wide setting, and return once new sessions see it."""
+    with connect_to_test_server(autocommit=True) as admin:
+        if value:
+            admin.execute(f"ALTER SYSTEM SET synchronous_standby_names = '{value}'".encode())
+        else:
+            admin.execute("ALTER SYSTEM RESET synchronous_standby_names")
+        admin.execute("SELECT pg_reload_conf()")
+
+    wait_until(lambda: admin_rows("SHOW synchronous_standby_names") == [(value,)])
+
+
+@pytest.mark.database
+def test_real_deadline_fires_while_commit_waits_for_a_missing_standby(
+    database: Callable[..., Connection],
+) -> None:
+    opened: list[Connection] = []
+
+    def connect() -> Connection:
+        opened.append(database())
+        return opened[-1]
+
+    try:
+        set_synchronous_standby_names("no_such_standby")
+        # Sessions read the setting at once, but COMMIT follows a flag that the
+        # checkpointer sets after its own reload, and nothing shows when that happens.
+        time.sleep(1)
+
+        before = time.monotonic()
+        result = beat(
+            connect,
+            statement_timeout=timedelta(milliseconds=200),
+            lock_timeout=timedelta(milliseconds=200),
+            deadline=timedelta(seconds=2),
+        )
+        elapsed = time.monotonic() - before
+        waiting = admin_rows("SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep'")
+    finally:
+        set_synchronous_standby_names("")
+        if opened:
+            wait_until(lambda: opened[0].closed)
+
+    assert result.failure is BeatFailure.UNKNOWN
+    assert not result.ok
+    assert 2 <= elapsed < 5
+    assert waiting == [(1,)]
+    # Reported as unknown, and it did commit once the wait ended: "may still commit".
+    assert len(admin_rows("SELECT 1 FROM aurora_mirrorcheck.heartbeat")) == 1
 
 
 @pytest.mark.database
