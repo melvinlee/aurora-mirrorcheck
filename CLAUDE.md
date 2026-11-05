@@ -39,3 +39,15 @@ These cut across layers and are easy to break:
 - **Evidence integrity:** Evidence is canonical JSON with a SHA-256 digest. The report and attestations reference that digest, and every run records the tool version and config digest.
 - **Failure reporting:** An ERROR never reports as PASS. A crashed run leaves no state behind. A heartbeat that could not be written is reported separately from a lag breach.
 - **Connections:** Use `sslmode=verify-full` to both regions. Credentials come from Secrets Manager or IAM DB auth via IRSA, never from config, images or logs.
+
+## Git workflow
+
+Always pull the latest `main` before branching, and always branch from `main`:
+
+```bash
+git switch main
+git pull --ff-only origin main
+git switch -c <branch>
+```
+
+Never add a `Co-Authored-By` line to a commit.
