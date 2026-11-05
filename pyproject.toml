@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Validates that the secondary-region Aurora PostgreSQL cluster matches the primary within the RPO and produces DR test sign-off evidence."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "psycopg[binary]>=3.3.8",
+]
 
 [project.scripts]
 aurora-mirrorcheck = "aurora_mirrorcheck.cli:main"
