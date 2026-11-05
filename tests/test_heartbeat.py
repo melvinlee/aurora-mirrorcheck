@@ -5,7 +5,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.pq import TransactionStatus
 
 from aurora_mirrorcheck.heartbeat import (
@@ -40,6 +40,11 @@ HOST_OVERRIDE_VARIABLES = ("PGHOSTADDR", "PGSERVICE")
 SHORT_DEADLINE = timedelta(milliseconds=50)
 # A test's blocked commit gives up after this long, so a bug fails it instead of hanging it.
 BLOCK_LIMIT_SECONDS = 10.0
+# The missing-standby test's value. Only a value this exact is safe to clear.
+STANDBY_SENTINEL = "no_such_standby"
+SHOW_STANDBY_NAMES = "SHOW synchronous_standby_names"
+# The database that the `pg-podman` agent creates. `ALTER SYSTEM` runs nowhere else.
+TEST_DATABASE = "mirrorcheck_test"
 
 
 def _dsn_refusal() -> str | None:
@@ -50,7 +55,7 @@ def _dsn_refusal() -> str | None:
     """
     try:
         params = conninfo_to_dict(os.environ.get(DSN_VARIABLE, ""))
-    except psycopg.Error:
+    except psycopg.Error, ValueError:  # A non-UTF-8 byte raises UnicodeEncodeError.
         return "it could not be parsed"
 
     if params.get("host") not in LOCAL_HOSTS:
@@ -756,10 +761,15 @@ def test_direct_admin_queries_refuse_a_remote_dsn(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.fixture
-def database() -> Iterator[Callable[..., Connection]]:
-    """Connect as a role with only the grants FR-01 needs, on a disposable local server."""
+def dsn_is_set() -> None:
     if DSN_VARIABLE not in os.environ:
         pytest.skip(f"{DSN_VARIABLE} is not set")
+
+
+@pytest.fixture
+def database(dsn_is_set: None) -> Iterator[Callable[..., Connection]]:
+    """Connect as a role with only the grants FR-01 needs, on a disposable local server."""
+    clear_standby_setting_left_by_a_killed_run()
 
     role = "mirrorcheck_test"
     with connect_to_test_server(autocommit=True) as admin:
@@ -895,16 +905,88 @@ def test_real_lock_timeout_fails_a_queued_lock_before_the_statement_timeout(
     assert result.detail == "LockNotAvailable (55P03)"
 
 
+def refuse_unless_on_the_test_database(admin: Connection) -> None:
+    """Fail unless `admin` is on the `pg-podman` database.
+
+    A loopback tunnel to a real server passes the host guard, and `ALTER SYSTEM`
+    there could block every commit. Failing rather than skipping keeps that visible.
+    """
+    row = admin.execute("SELECT current_database()").fetchone()
+    if row != (TEST_DATABASE,):
+        pytest.fail(f"refused ALTER SYSTEM: this is not the {TEST_DATABASE} database: {row}")
+
+
 def set_synchronous_standby_names(value: str) -> None:
     """Change the server-wide setting, and return once new sessions see it."""
     with connect_to_test_server(autocommit=True) as admin:
+        refuse_unless_on_the_test_database(admin)
         if value:
             admin.execute(f"ALTER SYSTEM SET synchronous_standby_names = '{value}'".encode())
         else:
             admin.execute("ALTER SYSTEM RESET synchronous_standby_names")
         admin.execute("SELECT pg_reload_conf()")
 
-    wait_until(lambda: admin_rows("SHOW synchronous_standby_names") == [(value,)])
+    wait_until(lambda: admin_rows(SHOW_STANDBY_NAMES) == [(value,)])
+
+
+def a_commit_finishes(limit: float = BLOCK_LIMIT_SECONDS) -> bool:
+    """Say whether a commit that wrote WAL gets through in time.
+
+    Only such a commit waits for a standby, so a temporary table is the smallest
+    probe that can block. The wait ends once COMMIT sees the reset, which proves that
+    the reset took effect. It runs in a daemon thread because psycopg won't limit it.
+    """
+    finished = threading.Event()
+
+    def commit() -> None:
+        with connect_to_test_server(autocommit=True) as conn:
+            conn.execute("CREATE TEMP TABLE commit_probe ()")
+        finished.set()
+
+    threading.Thread(target=commit, daemon=True).start()
+    return finished.wait(limit)
+
+
+def clear_standby_setting_left_by_a_killed_run() -> None:
+    """Undo the missing-standby test's setting, which would block every later commit.
+
+    Any other value isn't ours to change, so it stops the run before a commit can hang.
+    """
+    value = admin_rows(SHOW_STANDBY_NAMES)[0][0]
+    if value == STANDBY_SENTINEL:
+        set_synchronous_standby_names("")
+        if not a_commit_finishes():
+            pytest.fail("commits still block after resetting synchronous_standby_names")
+    elif value:
+        pytest.fail(
+            f"synchronous_standby_names is {value!r}, which these tests did not set, so "
+            "commits may block forever. It was left unchanged: clear it or use another server."
+        )
+
+
+@contextmanager
+def standby_setting_in_force(value: str) -> Iterator[None]:
+    """Hold `value` for the block, and always reset it afterwards.
+
+    If the block hangs in a commit that waits for the standby, a watchdog resets the
+    setting after `BLOCK_LIMIT_SECONDS`, and that fails the test instead of hanging it.
+    """
+    released_a_hang = threading.Event()
+
+    def release() -> None:
+        released_a_hang.set()
+        set_synchronous_standby_names("")
+
+    watchdog = threading.Timer(BLOCK_LIMIT_SECONDS, release)
+    try:
+        set_synchronous_standby_names(value)
+        time.sleep(1)  # COMMIT lags the setting: see the missing-standby test.
+        watchdog.start()
+        yield
+        assert not released_a_hang.is_set(), "the block hung until the watchdog released it"
+    finally:
+        watchdog.cancel()
+        set_synchronous_standby_names("")
 
 
 @pytest.mark.database
@@ -918,7 +1000,7 @@ def test_real_deadline_fires_while_commit_waits_for_a_missing_standby(
         return opened[-1]
 
     try:
-        set_synchronous_standby_names("no_such_standby")
+        set_synchronous_standby_names(STANDBY_SENTINEL)
         # Sessions read the setting at once, but COMMIT follows a flag that the
         # checkpointer sets after its own reload, and nothing shows when that happens.
         time.sleep(1)
@@ -943,6 +1025,48 @@ def test_real_deadline_fires_while_commit_waits_for_a_missing_standby(
     assert waiting == [(1,)]
     # Reported as unknown, and it did commit once the wait ended: "may still commit".
     assert len(admin_rows("SELECT 1 FROM aurora_mirrorcheck.heartbeat")) == 1
+
+
+@pytest.mark.database
+@pytest.mark.usefixtures("dsn_is_set")
+def test_real_database_fixture_recovers_from_a_killed_run(request: pytest.FixtureRequest) -> None:
+    with standby_setting_in_force(STANDBY_SENTINEL):
+        assert not a_commit_finishes(limit=0.5)
+
+        connect = request.getfixturevalue("database")
+
+        assert admin_rows(SHOW_STANDBY_NAMES) == [("",)]
+        assert beat(connect, deadline=timedelta(seconds=2)).ok
+
+
+@pytest.mark.database
+@pytest.mark.usefixtures("dsn_is_set")
+def test_real_database_fixture_leaves_any_other_standby_setting_alone(
+    request: pytest.FixtureRequest,
+) -> None:
+    other = "someone_elses_standby"
+
+    with standby_setting_in_force(other):
+        with pytest.raises(pytest.fail.Exception, match=f"{other}.*left unchanged"):
+            request.getfixturevalue("database")
+
+        assert admin_rows(SHOW_STANDBY_NAMES) == [(other,)]
+
+
+@pytest.mark.database
+@pytest.mark.usefixtures("dsn_is_set")
+def test_real_alter_system_is_refused_outside_the_test_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with standby_setting_in_force(STANDBY_SENTINEL), monkeypatch.context() as outside:
+        outside.setenv(DSN_VARIABLE, make_conninfo(require_local_dsn(), dbname="postgres"))
+
+        with pytest.raises(pytest.fail.Exception, match="refused ALTER SYSTEM"):
+            clear_standby_setting_left_by_a_killed_run()
+        with pytest.raises(pytest.fail.Exception, match="refused ALTER SYSTEM"):
+            set_synchronous_standby_names("")
+
+        assert admin_rows(SHOW_STANDBY_NAMES) == [(STANDBY_SENTINEL,)]
 
 
 @pytest.mark.database

@@ -4,7 +4,7 @@ Proves that the secondary-region Aurora PostgreSQL cluster (Aurora Global Databa
 
 It validates only. It never fails over, promotes, steers traffic or repairs data, and it covers Aurora PostgreSQL only.
 
-**Status:** early development. Only the package skeleton exists, and `gate` and `attest` are stubs that exit 2 (ERROR). The requirements are in [`PRD/aurora-mirrorcheck-prd.md`](PRD/aurora-mirrorcheck-prd.md).
+**Status:** early development. The heartbeat writer (FR-01) exists as library code, but no runner calls it yet, and `gate` and `attest` are stubs that exit 2 (ERROR). The requirements are in [`PRD/aurora-mirrorcheck-prd.md`](PRD/aurora-mirrorcheck-prd.md).
 
 ## Getting started
 
@@ -36,7 +36,7 @@ Tests marked `database` are excluded from the default run. They need a disposabl
 AURORA_MIRRORCHECK_TEST_DSN='postgresql://postgres:mirrorcheck_test@127.0.0.1:55433/mirrorcheck_test' uv run pytest -m database
 ```
 
-These tests drop and recreate the `aurora_mirrorcheck` schema and the server-wide `mirrorcheck_test` role, and one test briefly sets `synchronous_standby_names` with `ALTER SYSTEM`, so never point them at a server you care about. A test run that is killed during that test leaves the setting in place, and every commit on the server then blocks until you run `ALTER SYSTEM RESET synchronous_standby_names` and reload. The test run fails unless the DSN's host is exactly `localhost`, `127.0.0.1` or `::1`, and it also refuses `hostaddr`, `service`, `PGHOSTADDR` and `PGSERVICE`. If `AURORA_MIRRORCHECK_TEST_DSN` isn't set, the `database` tests skip. The check can't tell what is listening on the port, so don't use it with a tunnel or port-forward to a real database.
+These tests drop and recreate the `aurora_mirrorcheck` schema and the server-wide `mirrorcheck_test` role, and a few tests briefly set `synchronous_standby_names` with `ALTER SYSTEM`, so never point them at a server you care about. A test run that is killed during one of those tests leaves the setting in place, and every commit on the server can then block. The next run clears the missing-standby test's value before it writes anything. If the setting holds any other value, the run fails and leaves it alone, and you must clear it yourself with `ALTER SYSTEM RESET synchronous_standby_names` and a reload. Every `ALTER SYSTEM` in the tests first checks that the connection is on a database named `mirrorcheck_test`, and fails if it isn't, so these tests need the DSN to use the `pg-podman` database name. The test run fails unless the DSN's host is exactly `localhost`, `127.0.0.1` or `::1`, and it also refuses `hostaddr`, `service`, `PGHOSTADDR` and `PGSERVICE`. If `AURORA_MIRRORCHECK_TEST_DSN` isn't set, the `database` tests skip. The check can't tell what is listening on the port, so don't use it with a tunnel or port-forward to a real database.
 
 To add a dependency, use `uv add <package>`, or `uv add --dev <package>` for a dev tool. Commit the changes to both `pyproject.toml` and `uv.lock`.
 

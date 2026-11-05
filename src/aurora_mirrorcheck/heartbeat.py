@@ -28,9 +28,9 @@ it finishes, and its late result is discarded so that it can never pass for a
 later slot's beat. Until then the loop starts no new beat, so a server that holds
 commits never collects a pile of waiting connections.
 
-The heartbeat's 10 s `statement_timeout` is a deliberate departure from the 30 min
-default in NFR-05, for the heartbeat only. A beat runs every 30 s, and a stuck one
-must be reported as a failure (FR-03) rather than go silent for 30 minutes.
+NFR-05 makes the heartbeat an exception to its 30 min default: a 10 s
+`statement_timeout` per statement and a 5 s `lock_timeout`. A beat runs every 30 s,
+and a stuck one must be reported as a failure (FR-03) rather than go silent.
 
 A beat never raises for a database failure. It returns a `BeatResult` that says
 which step failed, so that a heartbeat that could not be written stays distinct
@@ -96,7 +96,8 @@ class BeatResult:
 
     After a purge failure `heartbeat` is still set, because the row was committed
     and can still be polled for on the secondary. After an unknown failure it is
-    `None` even though a row may exist, because nothing is known about that row.
+    `None` even though a row may have committed, or may still commit, because the
+    beat never learned the outcome.
     """
 
     heartbeat: Heartbeat | None = None
@@ -248,12 +249,14 @@ def run_heartbeat_loop(
 
     A failed beat does not end the loop, because the next one may succeed. Beats
     stay on a fixed 30 s grid. `deadline` must be under the interval, so that a
-    stuck beat can't silently swallow a slot.
+    stuck beat can't silently swallow a slot. A slow `report` can still do that:
+    any slot that passes while it runs is skipped, and nothing reports the skip.
 
     Beats never overlap. While an earlier worker is still running, each slot
     reports an unknown failure and starts nothing, and `stop` and `report` keep
     working. A worker's late result is discarded, but a late unexpected error is
-    raised at the next slot, as it would have been on time.
+    raised at the next slot, as it would have been on time. There is no next slot
+    after `stop`, so a late error that arrives after it is dropped.
     """
     timeouts = _timeouts(statement_timeout, lock_timeout)
     seconds = _deadline_seconds(deadline)
