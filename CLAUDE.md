@@ -20,7 +20,7 @@ uv run pytest tests/test_cli.py::test_help_exits_zero  # Run a single test
 uv run aurora-mirrorcheck --help                       # Run the CLI
 ```
 
-Tests marked `database` are excluded from the default run.
+Tests marked `database` are excluded from the default run. They need `AURORA_MIRRORCHECK_TEST_DSN` set to a disposable server, which the `pg-podman` agent can start. They drop the `aurora_mirrorcheck` schema and the `mirrorcheck_test` role, so the run fails unless the host in the DSN is exactly `localhost`, `127.0.0.1` or `::1`.
 
 If the repo is in an iCloud-synced folder such as `~/Documents`, iCloud can hide files in `.venv`. Python then skips the hidden editable-install `.pth` file and fails with `ModuleNotFoundError: No module named 'aurora_mirrorcheck'`. Set `UV_PROJECT_ENVIRONMENT` to a path outside iCloud to avoid this.
 

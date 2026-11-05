@@ -138,7 +138,7 @@ Six layers, from cheap and continuous to heavy and on demand. A gate run execute
 | NFR-02 | Security | Credentials from Secrets Manager or IAM DB auth via IRSA; no secrets in config, images or logs |
 | NFR-03 | Security | TLS (`sslmode=verify-full`) to both regions |
 | NFR-04 | Data handling | Evidence holds counts, hashes and primary keys only, never row contents |
-| NFR-05 | Load | No query on the primary writer except the heartbeat; statement timeout on every query (default 30 min) |
+| NFR-05 | Load | No query on the primary writer except the heartbeat; statement timeout on every query (default 30 min). The heartbeat is the exception: 10 s statement timeout per statement and 5 s lock timeout, both configurable |
 | NFR-06 | Load | Full checksum runs off-peak; concurrency configurable, default 2 tables at a time |
 | NFR-07 | Performance | A full gate run on 20 GB finishes within 30 min |
 | NFR-08 | Correctness | Zero false FAILs caused by replication lag; every FAIL is reproducible from the evidence |
